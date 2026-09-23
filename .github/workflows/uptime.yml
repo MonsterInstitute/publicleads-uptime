@@ -47,6 +47,7 @@ jobs:
             "health|/api/health|2000"
             "homepage|/|2000"
             "city-page|/accountants/usa/california/los-angeles|3000"
+            "DELIBERATE-FAILURE-TEST|/this-path-does-not-exist-uptime-test|2000"
           )
 
           check() {   # check <name> <path> <max_ms>  -> 0 ok, 1 bad
