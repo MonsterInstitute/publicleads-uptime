@@ -1,0 +1,96 @@
+name: uptime
+
+# External monitoring for https://www.publicleads.com
+#
+# This lives in a PUBLIC repository on purpose. Actions minutes are free and
+# unmetered for public repos, and the private repo's Actions were blocked on
+# 2026-09-21 by "recent account payments have failed or your spending limit
+# needs to be increased" — a monitor that dies with the billing it is meant to
+# outlive is not a monitor.
+#
+# It is also the ONLY external viewpoint we have. The Vercel cron and the
+# laptop monitor both observe the site from infrastructure that fails with it:
+# on 2026-09-20 every URL returned 402 and neither could say so.
+#
+# NO SECRETS, deliberately. Everything here curls a public URL. Alerting is
+# GitHub's own "workflow run failed" email, which needs no key and cannot leak
+# one. That costs the Vercel deploy-state check and the de-duplicated
+# re-notify schedule the private version had; the trade is a public repo with
+# nothing in it worth stealing.
+on:
+  schedule:
+    # Every 15 minutes. Free minutes make */5 affordable, but GitHub's
+    # scheduler is best-effort under load and a tighter cron mostly buys
+    # jitter. 15 detects an outage well inside the hour.
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    # No checkout, no npm install, no token. The job is three curls.
+    permissions: {}
+    steps:
+      - name: probe
+        shell: bash
+        run: |
+          set -uo pipefail
+          SITE="https://www.publicleads.com"
+          fail=0
+
+          # name|path|max_ms
+          probes=(
+            "health|/api/health|2000"
+            "homepage|/|2000"
+            "city-page|/accountants/usa/california/los-angeles|3000"
+          )
+
+          check() {   # check <name> <path> <max_ms>  -> 0 ok, 1 bad
+            local name="$1" path="$2" max="$3"
+            local out code ms
+            out=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' \
+                       --max-time 30 -H 'cache-control: no-cache' "$SITE$path") || {
+              echo "  $name: curl failed outright"; return 1; }
+            code=${out%% *}
+            ms=$(awk -v t="${out##* }" 'BEGIN{printf "%d", t*1000}')
+            if [[ "$code" != "200" ]]; then
+              echo "  $name: HTTP $code (${ms}ms)"; return 1
+            fi
+            if (( ms > max )); then
+              echo "  $name: 200 but ${ms}ms > ${max}ms"; return 1
+            fi
+            echo "  $name: 200 in ${ms}ms"
+            return 0
+          }
+
+          for p in "${probes[@]}"; do
+            IFS='|' read -r name path max <<< "$p"
+            if ! check "$name" "$path" "$max"; then
+              # Confirm before failing. A single slow response is not an
+              # outage, and an alert that cries wolf gets muted — which is the
+              # failure the monitor exists to prevent.
+              echo "  $name: confirming in 15s…"
+              sleep 15
+              if ! check "$name" "$path" "$max"; then
+                echo "::error title=uptime::$name is failing on two consecutive probes"
+                fail=1
+              else
+                echo "  $name: recovered on confirm, not alerting"
+              fi
+            fi
+          done
+
+          # /api/health reports its own verdict; a degraded body with HTTP 200
+          # would otherwise pass silently.
+          body=$(curl -s --max-time 30 "$SITE/api/health") || body=""
+          echo "  health body: ${body:0:200}"
+          if [[ "$body" != *'"status":"ok"'* ]]; then
+            echo "::error title=uptime::/api/health did not report status ok"
+            fail=1
+          fi
+
+          exit $fail
